@@ -1,326 +1,302 @@
 exports.init = function(grunt) {
-
   var path = require('path');
-  var extname = path.extname;
   var ast = require('cmd-util').ast;
   var iduri = require('cmd-util').iduri;
-  var relative = require('relative');
-  var md5 = require('./util').md5;
   var _ = grunt.util._;
 
-  return {
-    jsParser: jsParser
-  };
+  var exports = {};
 
-  function jsParser(fileObj, options) {
+  exports.jsParser = function(fileObj, options) {
     grunt.log.verbose.writeln('Transport ' + fileObj.src + ' -> ' + fileObj.dest);
+    var astCache, data = fileObj.srcData || grunt.file.read(fileObj.src);
+    try {
+      astCache = ast.getAst(data);
+    } catch(e) {
+      grunt.log.error('js parse error ' + fileObj.src.red);
+      grunt.fail.fatal(e.message + ' [ line:' + e.line + ', col:' + e.col + ', pos:' + e.pos + ' ]');
+    }
 
+    var meta = ast.parseFirst(astCache);
 
-    // cache every filepath content to generate hash
-    //
-    // {
-    //   '/path/to/file': {
-    //     id: undefined,
-    //     dependencies: [],
-    //     depMap: {},
-    //     depsSpecified: false,
-    //     contents: contents,
-    //     path: path,
-    //     hash: md5(contents, [])
-    //   }
-    // }
-    var fileCache = {};
+    if (!meta) {
+      grunt.log.warn('found non cmd module "' + fileObj.src + '"');
+      // do nothing
+      return;
+    }
 
-    var file = getFileInfo(path.join(process.cwd(), fileObj.src));
+    if (meta.id) {
+      grunt.log.verbose.writeln('id exists in "' + fileObj.src + '"');
+    }
 
-    if (!file) return;
-
-    var data, filepath;
-    if (!options.hash) {
-
-      // create original file, xxx.js
-      data = ast.modify(file.contents, {
-        id: unixy(options.idleading) + getId(file),
-        dependencies: getDeps(file),
-        require: function(v) {
-          // ignore when deps is specified by developer
-          return file.depsSpecified ? v : iduri.parseAlias(options, v);
-        }
-      }).print_to_string(options.uglify);
-      filepath = fileObj.dest;
-      writeFile(data, filepath);
+    var deps, depsSpecified = false;
+    if (meta.dependencyNode) {
+      deps = meta.dependencies;
+      depsSpecified = true;
+      grunt.log.verbose.writeln('dependencies exists in "' + fileObj.src + '"');
     } else {
-
-      // create file with hash, xxx-2cio56s.js
-      var hash = file.hash;
-      data = ast.modify(file.contents, {
-        id: unixy(options.idleading) + getId(file) + '-' + hash,
-        dependencies: getDeps(file, addHash),
-        require: function(v) {
-          // ignore when deps is specified by developer
-          if (file.depsSpecified) return v;
-          var depFile = file.depMap[v];
-          if (depFile) {
-            return addHash(depFile);
-          }
-          return iduri.parseAlias(options, v);
-        }
-      }).print_to_string(options.uglify);
-      filepath = fileObj.dest.replace(/\.js$/, '-' + hash + '.js');
-      writeFile(data, filepath);
+      // var start = new Date();
+      deps = parseDependencies(fileObj.src, options);
+      // var end = new Date();
+      // console.log((end.getTime()-start.getTime())/1000);
+      grunt.log.verbose.writeln(deps.length ?
+        'found dependencies ' + deps : 'found no dependencies');
     }
 
-    // create file with debug, xxx-debug.js
-    if (options.debug) {
-      data = ast.modify(data, addDebug).print_to_string(options.uglify);
-      writeFile(data, addDebug(filepath));
-    }
+    // create .js file
+    astCache = ast.modify(astCache, {
+      id: meta.id ? meta.id : unixy(options.idleading + fileObj.name.replace(/\.js$/, '')),
+      dependencies: deps,
+      require: function(v) {
+        // ignore when deps is specified by developer
+        return depsSpecified ? v : iduri.parseAlias(options, v);
+      }
+    });
+    data = astCache.print_to_string(options.uglify);
+    grunt.file.write(fileObj.dest, addOuterBoxClass(data, options));
 
-    function getId(file) {
-      return file.id || unixy(fileObj.name.replace(/\.js$/, ''));
-    }
 
-    function getDeps(file, fn) {
-      return file.dependencies.map(function(dep) {
-        if (typeof dep !== 'string') {
-          dep = fn ? fn(dep) : dep.id;
-        }
-        return dep.replace(/\.js$/, '');
-      });
+    // create -debug.js file
+    if (!options.debug) {
+      return;
     }
+    var dest = fileObj.dest.replace(/\.js$/, '-debug.js');
 
-    function addDebug(v) {
-      var ext = extname(v);
+    astCache = ast.modify(data, function(v) {
+      var ext = path.extname(v);
+
       if (ext && options.parsers[ext]) {
         return v.replace(new RegExp('\\' + ext + '$'), '-debug' + ext);
       } else {
         return v + '-debug';
       }
-    }
+    });
+    data = astCache.print_to_string(options.uglify);
+    grunt.file.write(dest, addOuterBoxClass(data, options));
+  };
 
-    function addHash(v) {
-      if (v.id.charAt(0) !== '.') return v.id;
-      if (!v.hash) return v.id;
 
-      var ext = extname(v.id);
-      if (ext && options.parsers[ext]) {
-        return v.id.replace(new RegExp('\\' + ext + '$'), '-' + v.hash + ext);
-      } else {
-        return v.id + '-' + v.hash;
-      }
-    }
-
-    function writeFile(data, dest) {
-      grunt.log.writeln('transport ' + dest + ' created');
-      grunt.file.write(dest, addOuterBoxClass(data + '\n', options));
-    }
-
-    // helpers
-    // ----------------
-    function unixy(uri) {
-      return uri.replace(/\\/g, '/');
-    }
-
-    function getStyleId() {
-      return unixy((options || {}).idleading || '')
-        .replace(/\/$/, '')
-        .replace(/\//g, '-')
-        .replace(/\./g, '_');
-    }
-
-    function addOuterBoxClass(data) {
-      // ex. arale/widget/1.0.0/ => arale-widget-1_0_0
-      var styleId = getStyleId(options);
-      if (options.styleBox && styleId) {
-        data = data.replace(/(\}\)[;\n\r ]*$)/, 'module.exports.outerBoxClass="' + styleId + '";$1');
-      }
-      return data;
-    }
-
-    function parseFileDependencies(filepath, depMap) {
-      if (!grunt.file.exists(filepath)) {
-        if (!/\{\w+\}/.test(filepath)) {
-          grunt.log.warn('can\'t find ' + filepath);
-        }
-        return [];
-      }
-
-      if (extname(filepath) !== '.js') {
-        return [];
-      }
-
-      var parsed, data = grunt.file.read(filepath);
-      try {
-        parsed = ast.parseFirst(data);
-      } catch(e) {
-        grunt.log.error(e.message + ' [ line:' + e.line + ', col:' + e.col + ', pos:' + e.pos + ' ]');
-        return [];
-      }
-
-      return parsed.dependencies.map(function(id) {
-        if (id.charAt(0) === '.') {
-          var origId = id;
-          id = iduri.appendext(id);
-          var depFilepath = path.join(path.dirname(filepath), id);
-          var depFile = getFileInfo(depFilepath);
-          if (!depFile) return;
-          var obj = {
-            id: origId,
-            path: depFile.path,
-            contents: depFile.contents,
-            hash: depFile.hash,
-            relative: true
-          };
-          if (depMap) depMap[origId] = obj;
-          return [obj].concat(parseFileDependencies(depFilepath));
-        } else {
-          return parseModuleDependencies(id);
-        }
-      });
-    }
-
-    function parseModuleDependencies(id) {
-      var alias = iduri.parseAlias(options, id);
-
-      if (iduri.isAlias(options, id) && alias === id) {
-        // usually this is "$"
-        return [{id: id}];
-      }
-
-      // don't resolve text!path/to/some.xx, same as seajs-text
-      if (/^text!/.test(id)) {
-        return [{id: id}];
-      }
-
-      var fpath = iduri.appendext(alias);
-
-      var fbase;
-      options.paths.some(function(base) {
-        var filepath = path.join(base, fpath);
-        if (grunt.file.exists(filepath)) {
-          grunt.log.verbose.writeln('find module "' + filepath + '"');
-          fbase = base;
-          fpath = filepath;
-          return true;
-        }
-      });
-
-      if (!fpath) {
-        grunt.fail.warn('can\'t find module ' + alias);
-        return [{id: id}];
-      }
-
-      var file = getFileInfo(fpath);
-
-      if (!file) {
-        return [{id: id}];
-      }
-
-      // don't parse no javascript dependencies
-      if (!/\.js$/.test(fpath)) {
-        return [{
-          id: alias,
-          path: file.path,
-          hash: file.hash,
-          contents: file.contents
-        }];
-      }
-
-      var parsed = ast.parse(file.contents);
-      var ids = parsed.map(function(meta) {
-        return meta.id;
-      });
-      var deps = parsed.map(function(meta) {
-        return meta.dependencies.map(function(id) {
-          id = iduri.absolute(alias, id);
-          // won't return if deps were loaded(defined in file)
-          if (!_.contains(ids, id) && !_.contains(ids, id.replace(/\.js$/, ''))) {
-            id = iduri.appendext(id);
-            var file = getFileInfo(path.join(fbase, id));
-            if (!file) return;
-            return {
-              id: id,
-              path: file.path,
-              hash: file.hash,
-              contents: file.contents
-            };
-          }
-        });
-      });
-      return [{
-        id: alias,
-        path: file.path,
-        hash: file.hash,
-        contents: file.contents
-      }].concat(deps);
-    }
-
-    function getFileInfo(path){
-      if (fileCache[path]) {
-        return fileCache[path];
-      }
-
-      if (!grunt.file.exists(path)) return;
-      var astCache, deps, contents = grunt.file.read(path);
-
-      if (extname(path) !== '.js') {
-        return fileCache[path] = {
-          id: undefined,
-          dependencies: [],
-          depMap: {},
-          depsSpecified: false,
-          contents: contents,
-          path: path,
-          hash: md5(contents, [])
-        };
-      }
-
-      try {
-        astCache = ast.getAst(contents);
-      } catch(e) {
-        grunt.log.error('js parse error ' + path.red);
-        grunt.fail.fatal(e.message + ' [ line:' + e.line + ', col:' + e.col + ', pos:' + e.pos + ' ]');
-      }
-
-      // get id/deps of origin cmd module
-      var meta = ast.parseFirst(astCache), depMap = {};
-
-      if (!meta) {
-        grunt.log.warn('found non cmd module "' + path + '"');
-        // do nothing
-        return;
-      }
-
-      if (meta.id) {
-        grunt.log.verbose.writeln('id exists in "' + path + '"');
-      }
-
-      if (meta.dependencyNode) {
-        deps = meta.dependencies;
-        grunt.log.verbose.writeln('dependencies exists in "' + path + '"');
-      } else {
-        deps = parseFileDependencies(path, depMap);
-        deps = grunt.util._.chain(deps)
-          .flatten()
-          .filter(function(item) {return typeof item !== 'undefined'})
-          .uniq(function(item) {return item.path})
-          .each(function(item) {
-            if (item.relative) item.id = relative(path, item.path);
-          })
-          .value();
-        grunt.log.verbose.writeln(deps.length ?
-          'found dependencies ' + deps : 'found no dependencies');
-      }
-
-      return fileCache[path] = {
-        id: meta.id,
-        dependencies: deps,
-        depMap: depMap,
-        depsSpecified: typeof meta.dependencyNode !== 'undefined',
-        contents: contents,
-        path: path,
-        hash: typeof meta.dependencyNode !== 'undefined' ? '' : md5(contents, deps)
-      };
-    }
+  // helpers
+  // ----------------
+  function unixy(uri) {
+    return uri.replace(/\\/g, '/');
   }
+
+  function getStyleId(options) {
+    return unixy((options || {}).idleading || '')
+      .replace(/\/$/, '')
+      .replace(/\//g, '-')
+      .replace(/\./g, '_');
+  }
+
+  function addOuterBoxClass(data, options) {
+    // ex. arale/widget/1.0.0/ => arale-widget-1_0_0
+    var styleId = getStyleId(options);
+    if (options.styleBox && styleId) {
+      data = data.replace(/(\}\)[;\n\r ]*$)/, 'module.exports.outerBoxClass="' + styleId + '";$1');
+    }
+    return data;
+  }
+
+  // 获取依赖, 只有一层
+  function moduleDependencies(id, options) {
+    var alias = iduri.parseAlias(options, id);
+
+    if (iduri.isAlias(options, id) && alias === id) {
+      // usually this is "$"
+      return [];
+    }
+
+    // don't resolve text!path/to/some.xx, same as seajs-text
+    if (/^text!/.test(id)) {
+      return [];
+    }
+
+    var file = iduri.appendext(alias);
+
+    if (!/\.js$/.test(file)) {
+      return [];
+    }
+
+    var fpath;
+    options.paths.some(function(base) {
+      var filepath = path.join(base, file);
+      if (grunt.file.exists(filepath)) {
+        grunt.log.verbose.writeln('find module "' + filepath + '"');
+        fpath = filepath;
+        return true;
+      }
+    });
+
+    if (!fpath) {
+      grunt.fail.warn("can't find module " + alias);
+      return [];
+    }
+    if (!grunt.file.exists(fpath)) {
+      grunt.fail.warn("can't find " + fpath);
+      return [];
+    }
+    var data = grunt.file.read(fpath);
+    var parsed = ast.parse(data);
+    var deps = [];
+
+    var ids = parsed.map(function(meta) {
+      return meta.id;
+    });
+
+    parsed.forEach(function(meta) {
+      meta.dependencies.forEach(function(dep) {
+        dep = iduri.absolute(alias, dep);
+        if (!_.contains(deps, dep) && !_.contains(ids, dep) && !_.contains(ids, dep.replace(/\.js$/, ''))) {
+          deps.push(dep);
+        }
+      });
+    });
+
+    // console.log(id)
+    // console.log(deps);
+    return deps;
+  }
+
+  // life, 缓存
+  var fileParsedCache = {};
+  function getFileParsed(fpath) {
+    if (fileParsedCache[fpath]) {
+      // console.log('已存在');
+      return fileParsedCache[fpath];
+    }
+    if (!grunt.file.exists(fpath)) {
+      if (!/\{\w+\}/.test(fpath)) {
+        grunt.log.warn("can't find " + fpath);
+      }
+      return false;
+    }
+    var parsed, data = grunt.file.read(fpath);
+    try {
+      parsed = ast.parseFirst(data);
+    } catch(e) {
+      grunt.log.error(e.message + ' [ line:' + e.line + ', col:' + e.col + ', pos:' + e.pos + ' ]');
+      return false;
+    }
+    fileParsedCache[fpath] = parsed;
+    return parsed;
+  }
+
+  /**
+   * 之前的不足, 不能深入分析绝对模块内的依赖,
+   * 如require('cy/a'); 只能分析到cy/a模块的直接依赖, 没有递归分析其子模块的依赖
+   * 现在, 调用moduleDependencies后再递归分析之
+   */
+  function parseDependencies(fpath, options) {
+    var rootpath = fpath;
+
+    // console.log('rootpath: ' + rootpath);
+    console.log('正在解析: ' + fpath);
+    // 绝对模块的deps
+    var moduleDeps = {};
+
+    function relativeDependencies(fpath, options, basefile, isAbs) {
+
+      var deps = [];
+      var beforeDeps = [];
+      
+      if(!isAbs) {
+
+        // 相对
+        if (basefile) {
+          fpath = path.join(path.dirname(basefile), fpath);
+        }
+        fpath = iduri.appendext(fpath);
+        // console.log('fpath: ' + fpath + ' basefile: ' + basefile);
+
+        var deps = [];
+
+        var parsed = getFileParsed(fpath);
+        if (!parsed) {
+          return [];
+        }
+
+        beforeDeps = parsed.dependencies;
+      }
+      else {
+        beforeDeps = [];
+        beforeDeps = moduleDependencies(fpath, options);
+        // console.log(1);
+      }
+
+      beforeDeps.map(function(id) {
+        return id.replace(/\.js$/, '');
+      }).forEach(function(id) {
+        // console.log(id);
+
+        // 相对id依赖
+        if (id.charAt(0) === '.') {
+          // console.log('id ===> ' + id);
+          // fix nested relative dependencies
+          if (basefile) {
+            var altId = path.join(path.dirname(fpath), id).replace(/\\/g, '/');
+            var dirname = path.dirname(rootpath).replace(/\\/g, '/');
+            if ( dirname !== altId ) {
+              altId = path.relative(dirname, altId);
+            } else {
+              // the same name between file and directory
+              altId = path.relative(dirname, altId + '.js').replace(/\.js$/, '');
+            }
+            altId = altId.replace(/\\/g, '/');
+            if (altId.charAt(0) !== '.') {
+              altId = './' + altId;
+            }
+            deps.push(altId);
+            // console.log('altId ===> ' + altId);
+          } else {
+            // console.log('id ===> ' + id);
+            deps.push(id);
+          }
+
+          // 递归得到依赖
+          if (/\.js$/.test(iduri.appendext(id))) {
+            // console.error('id: ' + id + ' => fpath ' + fpath);
+            deps = grunt.util._.union(deps, relativeDependencies(id, options, fpath));
+          }
+
+          // console.log(id);
+          // console.log(deps)
+
+          // 这里处理的都是绝对id的依赖
+          // cy/module/client/material/material-manager
+          // 仅分析直接依赖
+        } else if (!moduleDeps[id]) {
+          // fpath = tmp/cy/hellosea.js
+          // console.log(fpath);
+          // id = cy/util
+          // console.log(id);
+          // 转化为fpath的相对
+
+          var alias = iduri.parseAlias(options, id);
+          deps.push(alias);
+
+          // don't parse no javascript dependencies
+          var ext = path.extname(alias);
+          if (ext && ext !== '.js') return;
+
+          // console.log('正在解析: ' + id);
+          // var mdeps = moduleDependencies(id, options);
+          var mdeps = relativeDependencies(id, options, '', true);
+          if(!mdeps) {
+            mdeps = [];
+          }
+          moduleDeps[id] = mdeps;
+          deps = grunt.util._.union(deps, mdeps);
+        }
+        else {
+          deps = grunt.util._.union(deps, moduleDeps[id]);
+          // console.log(id + ' 已存在');
+        }
+      });
+      return deps;
+    }
+
+    return relativeDependencies(fpath, options);
+  }
+
+  return exports;
 };
