@@ -34,8 +34,15 @@ exports.init = function(grunt) {
       depsSpecified = true;
       grunt.log.verbose.writeln('dependencies exists in "' + fileObj.src + '"');
     } else {
-      // var start = new Date();
+      // var s = new Date().getTime();
       deps = parseDependencies(fileObj.src, options);
+      // var e = new Date().getTime();
+      // console.log((e-s) + 'ms');
+      // console.log('xx => ' + fileObj.src);
+      // console.log(deps);
+      // A.push(1);
+      // console.log(A);
+
       // var end = new Date();
       // console.log((end.getTime()-start.getTime())/1000);
       grunt.log.verbose.writeln(deps.length ?
@@ -97,8 +104,26 @@ exports.init = function(grunt) {
     return data;
   }
 
-  // 获取依赖, 只有一层
+  var moduleDependenciesCache = {};
+
+  // life 11/20
+  // 这将是质的飞跃!!
   function moduleDependencies(id, options) {
+    if (!moduleDependenciesCache[id]) {
+      moduleDependenciesCache[id] = _moduleDependencies(id, options);
+    }
+    return moduleDependenciesCache[id];
+    
+    var deps = _moduleDependencies(id, options);
+    // console.log(id);
+    // console.log(deps);
+
+    return _moduleDependencies(id, options);
+  }
+
+  // 获取依赖, 只有一层
+  function _moduleDependencies(id, options) {
+   
     var alias = iduri.parseAlias(options, id);
 
     if (iduri.isAlias(options, id) && alias === id) {
@@ -152,18 +177,19 @@ exports.init = function(grunt) {
       });
     });
 
-    // console.log(id)
-    // console.log(deps);
     return deps;
   }
 
   // life, 缓存
   var fileParsedCache = {};
   function getFileParsed(fpath) {
+    // console.log('-----');
+
     if (fileParsedCache[fpath]) {
       // console.log('已存在');
       return fileParsedCache[fpath];
     }
+
     if (!grunt.file.exists(fpath)) {
       if (!/\{\w+\}/.test(fpath)) {
         grunt.log.warn("can't find " + fpath);
@@ -172,11 +198,15 @@ exports.init = function(grunt) {
     }
     var parsed, data = grunt.file.read(fpath);
     try {
+      // var s = new Date().getTime();
       parsed = ast.parseFirst(data);
+      // var e = new Date().getTime();
+      // console.log(fpath);
     } catch(e) {
       grunt.log.error(e.message + ' [ line:' + e.line + ', col:' + e.col + ', pos:' + e.pos + ' ]');
       return false;
     }
+    // console.log((e-s) + 'ms')
     fileParsedCache[fpath] = parsed;
     return parsed;
   }
@@ -190,7 +220,9 @@ exports.init = function(grunt) {
     var rootpath = fpath;
 
     // console.log('rootpath: ' + rootpath);
+
     console.log('正在解析: ' + fpath);
+
     // 绝对模块的deps
     var moduleDeps = {};
 
@@ -220,7 +252,6 @@ exports.init = function(grunt) {
       else {
         beforeDeps = [];
         beforeDeps = moduleDependencies(fpath, options);
-        // console.log(1);
       }
 
       beforeDeps.map(function(id) {
@@ -285,6 +316,9 @@ exports.init = function(grunt) {
             mdeps = [];
           }
           moduleDeps[id] = mdeps;
+
+          // console.log('??' + id);
+          // console.log(mdeps);
           deps = grunt.util._.union(deps, mdeps);
         }
         else {
